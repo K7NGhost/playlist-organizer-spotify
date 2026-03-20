@@ -1,6 +1,6 @@
 {
   "name": "spotify-playlist-organizer",
-  "displayName": "Spotify playlist organizer",
+  "displayName": "Playlist organizer for Spotify",
   "version": "0.0.1",
   "description": "Organize your spotify playlist.",
   "author": "k7nghost",
@@ -24,8 +24,28 @@
     "typescript": "5.3.3"
   },
   "manifest": {
+    "icons": {
+      "16": "../assets/logo.png",
+      "32": "../assets/logo.png",
+      "48": "../assets/logo.png",
+      "128": "../assets/logo.png"
+    },
+    "action": {
+      "default_popup": "popup.html",
+      "default_icon": {
+        "16": "../assets/logo.png",
+        "32": "../assets/logo.png",
+        "48": "../assets/logo.png",
+        "128": "../assets/logo.png"
+      }
+    },
+    "permissions": [
+      "identity",
+      "storage"
+    ],
     "host_permissions": [
-      "https://*/*"
+      "https://accounts.spotify.com/*",
+      "https://api.spotify.com/*"
     ]
   }
 }
