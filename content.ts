@@ -32,7 +32,9 @@ function extractTrackContext(trackRow: Element): TrackContext | null {
     return null
   }
 
-  const playlistPage = document.querySelector<HTMLElement>('[data-testid="playlist-page"]')
+  const playlistPage = document.querySelector<HTMLElement>(
+    '[data-testid="playlist-page"]'
+  )
   const playlistUri = playlistPage?.getAttribute("data-test-uri")
   const playlistId = playlistUri?.split(":").pop()
 
@@ -40,12 +42,24 @@ function extractTrackContext(trackRow: Element): TrackContext | null {
     return null
   }
 
-  const tracklist = document.querySelector<HTMLElement>('[data-testid="playlist-tracklist"]')
-  const ariaRowCount = Number.parseInt(tracklist?.getAttribute("aria-rowcount") ?? "", 10)
-  const playlistLength = Number.isFinite(ariaRowCount) ? Math.max(ariaRowCount - 1, 1) : 1
+  const tracklist = document.querySelector<HTMLElement>(
+    '[data-testid="playlist-tracklist"]'
+  )
+  const ariaRowCount = Number.parseInt(
+    tracklist?.getAttribute("aria-rowcount") ?? "",
+    10
+  )
+  const playlistLength = Number.isFinite(ariaRowCount)
+    ? Math.max(ariaRowCount - 1, 1)
+    : 1
 
-  const trackLink = trackRow.querySelector<HTMLAnchorElement>('[data-testid="internal-track-link"]')
-  const trackId = trackLink?.getAttribute("href")?.split("/track/")[1]?.split("?")[0]
+  const trackLink = trackRow.querySelector<HTMLAnchorElement>(
+    '[data-testid="internal-track-link"]'
+  )
+  const trackId = trackLink
+    ?.getAttribute("href")
+    ?.split("/track/")[1]
+    ?.split("?")[0]
   const trackName = trackLink?.textContent?.trim() ?? "Selected track"
 
   if (!trackId) {
@@ -78,7 +92,9 @@ function showToast(message: string, isError = false) {
   toast.style.maxWidth = "340px"
   toast.style.padding = "12px 14px"
   toast.style.borderRadius = "14px"
-  toast.style.background = isError ? "rgba(122, 28, 28, 0.96)" : "rgba(17, 17, 17, 0.96)"
+  toast.style.background = isError
+    ? "rgba(122, 28, 28, 0.96)"
+    : "rgba(17, 17, 17, 0.96)"
   toast.style.color = "#ffffff"
   toast.style.fontFamily = '"Segoe UI", sans-serif'
   toast.style.fontSize = "13px"
@@ -108,7 +124,10 @@ function openPositionDialog(onSubmit: (index: number) => void) {
   closePositionDialog()
 
   const totalPositions = activeTrackContext.playlistLength
-  const currentPosition = Math.min(activeTrackContext.rowIndex + 1, totalPositions)
+  const currentPosition = Math.min(
+    activeTrackContext.rowIndex + 1,
+    totalPositions
+  )
 
   const overlay = document.createElement("div")
   overlay.id = POSITION_DIALOG_ID
@@ -209,7 +228,10 @@ function openPositionDialog(onSubmit: (index: number) => void) {
     const parsed = Number.parseInt(input.value, 10)
 
     if (!Number.isFinite(parsed) || parsed < 1 || parsed > totalPositions) {
-      showToast(`Enter a valid playlist position between 1 and ${totalPositions}.`, true)
+      showToast(
+        `Enter a valid playlist position between 1 and ${totalPositions}.`,
+        true
+      )
       input.focus()
       input.select()
       return
@@ -249,6 +271,19 @@ function openPositionDialog(onSubmit: (index: number) => void) {
   }, 0)
 }
 
+type StoredTrack = {
+  uid: string
+  id: string
+  position: number
+}
+
+type StoredPlaylist = {
+  id: string
+  uri: string
+  tracks: StoredTrack[]
+  complete: boolean
+}
+
 async function sendReorderRequest(
   moveTo: "top" | "middle" | "bottom" | "index",
   targetIndex?: number
@@ -259,13 +294,91 @@ async function sendReorderRequest(
   }
 
   const destinationLabel =
-    moveTo === "index"
-      ? `position ${targetIndex! + 1}`
-      : moveTo
+    moveTo === "index" ? `position ${targetIndex! + 1}` : moveTo
 
-  showToast(`Moving "${activeTrackContext.trackName}" to ${destinationLabel}...`)
+  showToast(
+    `Moving "${activeTrackContext.trackName}" to ${destinationLabel}...`
+  )
 
   try {
+    // --- Try partner API (UID-based) first using intercepted playlist data ---
+    const stored = await chrome.storage.local.get([
+      "interceptedPlaylist",
+      "capturedAccessToken",
+      "capturedClientToken"
+    ])
+
+    const intercepted = stored.interceptedPlaylist as StoredPlaylist | undefined
+    const accessToken = stored.capturedAccessToken as string | undefined
+    const clientToken = stored.capturedClientToken as string | undefined
+
+    if (
+      intercepted &&
+      accessToken &&
+      clientToken &&
+      intercepted.id === activeTrackContext.playlistId
+    ) {
+      const sorted = [...intercepted.tracks].sort(
+        (a, b) => a.position - b.position
+      )
+      const selectedTrack = sorted.find(
+        (t) => t.id === activeTrackContext!.trackId
+      )
+
+      if (selectedTrack?.uid) {
+        let fromUid: string | undefined
+        let moveType: "BEFORE_UID" | "AFTER_UID" = "BEFORE_UID"
+
+        if (moveTo === "top") {
+          fromUid = sorted.find((t) => t.uid !== selectedTrack.uid)?.uid
+        } else if (moveTo === "middle") {
+          const midIdx = Math.floor(sorted.length / 2)
+          const candidate = sorted[midIdx]
+          fromUid =
+            candidate?.uid !== selectedTrack.uid
+              ? candidate?.uid
+              : sorted[midIdx + 1]?.uid
+        } else if (moveTo === "index") {
+          const zeroIdx = Math.max(
+            0,
+            Math.min(targetIndex ?? 0, sorted.length - 1)
+          )
+          const candidate = sorted[zeroIdx]
+          fromUid =
+            candidate?.uid !== selectedTrack.uid
+              ? candidate?.uid
+              : sorted[zeroIdx + 1]?.uid
+        } else if (moveTo === "bottom") {
+          const lastAnchor = [...sorted]
+            .reverse()
+            .find((t) => t.uid !== selectedTrack.uid)
+          fromUid = lastAnchor?.uid
+          moveType = "AFTER_UID"
+        }
+
+        if (fromUid) {
+          const moveResponse = (await chrome.runtime.sendMessage({
+            type: "MOVE_ITEMS",
+            accessToken,
+            clientToken,
+            playlistUri: intercepted.uri,
+            uids: [selectedTrack.uid],
+            fromUid,
+            moveType
+          })) as { error?: string } | undefined
+
+          if (!moveResponse?.error) {
+            showToast(
+              `Moved "${activeTrackContext.trackName}" to ${destinationLabel}.`
+            )
+            return
+          }
+          // Partner API failed — fall through to REST
+        }
+      }
+    }
+
+    // --- Fall back to REST API ---
     const response = await chrome.runtime.sendMessage({
       type: "spotify-reorder-track",
       moveTo,
@@ -277,7 +390,10 @@ async function sendReorderRequest(
       throw new Error(response?.error ?? "Spotify reorder failed.")
     }
 
-    showToast(response.message ?? `Moved "${activeTrackContext.trackName}" successfully.`)
+    showToast(
+      response.message ??
+        `Moved "${activeTrackContext.trackName}" successfully.`
+    )
   } catch (error) {
     showToast(
       error instanceof Error ? error.message : "Spotify reorder failed.",
@@ -298,7 +414,8 @@ function createMenuButton(label: string, onClick: () => void) {
   button.tabIndex = -1
 
   const text = document.createElement("span")
-  text.className = "e-10180-text encore-text-body-small ellipsis-one-line yjdsntzei5QWfVvE"
+  text.className =
+    "e-10180-text encore-text-body-small ellipsis-one-line yjdsntzei5QWfVvE"
   text.setAttribute("data-encore-id", "text")
   text.setAttribute("dir", "auto")
   text.textContent = label
@@ -326,7 +443,9 @@ function createMenuButton(label: string, onClick: () => void) {
 
 function removeExistingInjectedMenu(menuList: Element) {
   Array.from(menuList.children)
-    .filter((node) => node instanceof HTMLElement && node.hasAttribute(MENU_ATTR))
+    .filter(
+      (node) => node instanceof HTMLElement && node.hasAttribute(MENU_ATTR)
+    )
     .forEach((node) => node.remove())
 }
 
@@ -362,16 +481,18 @@ function getVisibleMenuList() {
     Array.from(document.querySelectorAll<HTMLElement>(selector))
   )
 
-  return candidates.find((menu) => {
-    if (menu.closest(`#${SUBMENU_ROOT_ID}`)) {
-      return false
-    }
+  return (
+    candidates.find((menu) => {
+      if (menu.closest(`#${SUBMENU_ROOT_ID}`)) {
+        return false
+      }
 
-    const rect = menu.getBoundingClientRect()
-    const menuItemCount = menu.querySelectorAll('[role="menuitem"]').length
+      const rect = menu.getBoundingClientRect()
+      const menuItemCount = menu.querySelectorAll('[role="menuitem"]').length
 
-    return rect.width > 0 && rect.height > 0 && menuItemCount > 0
-  }) ?? null
+      return rect.width > 0 && rect.height > 0 && menuItemCount > 0
+    }) ?? null
+  )
 }
 
 function appendSubmenuActionItems(menuList: HTMLElement) {
@@ -402,7 +523,10 @@ function appendSubmenuActionItems(menuList: HTMLElement) {
   }
 }
 
-function openReorderSubmenu(anchorButton: HTMLElement, sourceMenu: HTMLElement) {
+function openReorderSubmenu(
+  anchorButton: HTMLElement,
+  sourceMenu: HTMLElement
+) {
   if (!activeTrackContext) {
     return
   }
@@ -448,7 +572,8 @@ function openReorderSubmenu(anchorButton: HTMLElement, sourceMenu: HTMLElement) 
   const gap = 4
   const edgePadding = 8
 
-  const fitsRight = rect.right + gap + submenuRect.width <= viewportWidth - edgePadding
+  const fitsRight =
+    rect.right + gap + submenuRect.width <= viewportWidth - edgePadding
   const preferredLeft = fitsRight
     ? rect.right + gap
     : rect.left - submenuRect.width - gap
@@ -490,7 +615,10 @@ function injectReorderMenu(menuList: HTMLElement) {
   reorderButton.className = "KzLH25pAEr43wpSc"
   reorderButton.setAttribute("role", "menuitem")
   reorderButton.setAttribute("aria-haspopup", "menu")
-  reorderButton.setAttribute("aria-expanded", reorderExpanded ? "true" : "false")
+  reorderButton.setAttribute(
+    "aria-expanded",
+    reorderExpanded ? "true" : "false"
+  )
   reorderButton.tabIndex = -1
 
   const left = document.createElement("div")
@@ -517,7 +645,10 @@ function injectReorderMenu(menuList: HTMLElement) {
     "--encore-icon-height: var(--encore-graphic-size-decorative-smaller); --encore-icon-width: var(--encore-graphic-size-decorative-smaller);"
   )
 
-  const arrowPath = document.createElementNS("http://www.w3.org/2000/svg", "path")
+  const arrowPath = document.createElementNS(
+    "http://www.w3.org/2000/svg",
+    "path"
+  )
   arrowPath.setAttribute("d", "M14 10 8 4l-6 6z")
   arrow.appendChild(arrowPath)
   right.appendChild(arrow)
@@ -575,7 +706,10 @@ function hydrateContextMenu() {
   }
 
   const signature = `${activeTrackContext.trackId}:${reorderExpanded}:${menuList.childElementCount}`
-  if (signature === lastMenuSignature && menuList.querySelector(`[${MENU_ATTR}]`)) {
+  if (
+    signature === lastMenuSignature &&
+    menuList.querySelector(`[${MENU_ATTR}]`)
+  ) {
     return
   }
 
@@ -583,38 +717,54 @@ function hydrateContextMenu() {
   lastMenuSignature = signature
 }
 
-document.addEventListener("contextmenu", (event) => {
-  tryCaptureTrackContext(event.target)
-  scheduleMenuHydration([0, 50, 150, 300, 500])
-}, true)
+document.addEventListener(
+  "contextmenu",
+  (event) => {
+    tryCaptureTrackContext(event.target)
+    scheduleMenuHydration([0, 50, 150, 300, 500])
+  },
+  true
+)
 
-document.addEventListener("pointerdown", (event) => {
-  tryCaptureTrackContext(event.target)
+document.addEventListener(
+  "pointerdown",
+  (event) => {
+    tryCaptureTrackContext(event.target)
 
-  const submenuRoot = document.getElementById(SUBMENU_ROOT_ID)
-  const target = event.target
+    const submenuRoot = document.getElementById(SUBMENU_ROOT_ID)
+    const target = event.target
 
-  if (
-    submenuRoot &&
-    target instanceof Node &&
-    !submenuRoot.contains(target) &&
-    !(target instanceof Element && target.closest(`[${REORDER_ITEM_ATTR}="root"]`))
-  ) {
-    closeInjectedSubmenu()
-  }
-}, true)
+    if (
+      submenuRoot &&
+      target instanceof Node &&
+      !submenuRoot.contains(target) &&
+      !(
+        target instanceof Element &&
+        target.closest(`[${REORDER_ITEM_ATTR}="root"]`)
+      )
+    ) {
+      closeInjectedSubmenu()
+    }
+  },
+  true
+)
 
-document.addEventListener("click", (event) => {
-  tryCaptureTrackContext(event.target)
+document.addEventListener(
+  "click",
+  (event) => {
+    tryCaptureTrackContext(event.target)
 
-  const moreButton = event.target instanceof Element
-    ? event.target.closest('[data-testid="more-button"]')
-    : null
+    const moreButton =
+      event.target instanceof Element
+        ? event.target.closest('[data-testid="more-button"]')
+        : null
 
-  if (moreButton) {
-    scheduleMenuHydration([0, 60, 160, 320, 520])
-  }
-}, true)
+    if (moreButton) {
+      scheduleMenuHydration([0, 60, 160, 320, 520])
+    }
+  },
+  true
+)
 
 const observer = new MutationObserver(() => {
   hydrateContextMenu()
@@ -623,4 +773,195 @@ const observer = new MutationObserver(() => {
 observer.observe(document.documentElement, {
   childList: true,
   subtree: true
+})
+
+// ---------------------------------------------------------------------------
+// Token capture — store Bearer tokens observed in fetch / XHR calls so the
+// background webRequest listener (the primary path) has a content-side backup.
+// Note: this overrides the content-script's own fetch/XHR, not the page's.
+// The background webRequest listener captures page-level requests as well.
+// ---------------------------------------------------------------------------
+
+const _originalFetch = window.fetch.bind(window)
+window.fetch = async function (...args: Parameters<typeof fetch>) {
+  const options = args[1]
+  const headers = options?.headers
+
+  if (headers) {
+    const isHeaders = headers instanceof Headers
+    const auth: string | null | undefined = isHeaders
+      ? headers.get("authorization") ?? headers.get("Authorization")
+      : (headers as Record<string, string>)?.["Authorization"] ??
+        (headers as Record<string, string>)?.["authorization"]
+    const clientTok: string | null | undefined = isHeaders
+      ? headers.get("client-token")
+      : (headers as Record<string, string>)?.["client-token"]
+
+    if (typeof auth === "string" && auth.startsWith("Bearer ")) {
+      chrome.storage.local.set({
+        capturedAccessToken: auth.replace("Bearer ", "")
+      })
+    }
+    if (typeof clientTok === "string" && clientTok) {
+      chrome.storage.local.set({ capturedClientToken: clientTok })
+    }
+  }
+
+  return _originalFetch(...args)
+}
+
+const _originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader
+XMLHttpRequest.prototype.setRequestHeader = function (
+  this: XMLHttpRequest,
+  header: string,
+  value: string
+) {
+  if (header === "Authorization" && value.startsWith("Bearer ")) {
+    chrome.storage.local.set({
+      capturedAccessToken: value.replace("Bearer ", "")
+    })
+  }
+  if (header === "client-token" && value) {
+    chrome.storage.local.set({ capturedClientToken: value })
+  }
+  return _originalSetRequestHeader.call(this, header, value)
+}
+
+// ---------------------------------------------------------------------------
+// Message handlers — used by the popup to check connectivity and read tokens
+// ---------------------------------------------------------------------------
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "PING") {
+    sendResponse({ message: "Pong from content script" })
+    return false
+  }
+
+  if (message?.type === "GET_TOKENS") {
+    chrome.storage.local.get(
+      ["capturedAccessToken", "capturedClientToken"],
+      (result) => {
+        sendResponse({
+          accessToken: result.capturedAccessToken ?? null,
+          clientToken: result.capturedClientToken ?? null
+        })
+      }
+    )
+    return true // keep channel open for async response
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Receive fetchPlaylistContents data dispatched by the page-world script.
+// CustomEvents on window are visible across JS worlds (page → content script).
+// ---------------------------------------------------------------------------
+
+type InterceptedTrack = {
+  uid: string
+  name: string
+  uri: string
+  id: string
+  trackNumber?: number
+}
+
+type SpoTracksDetail = {
+  playlistUri: string
+  offset: number
+  tracks: InterceptedTrack[]
+  complete: boolean
+  totalCount?: number
+}
+
+window.addEventListener("__spo_tracks__", (event) => {
+  const detail = (event as CustomEvent<SpoTracksDetail>).detail
+  console.log("[SPO:content] __spo_tracks__ received", detail)
+
+  // Basic validation — never trust data from the page world without checking
+  if (
+    !detail ||
+    typeof detail.playlistUri !== "string" ||
+    !detail.playlistUri.startsWith("spotify:playlist:") ||
+    !Array.isArray(detail.tracks)
+  ) {
+    return
+  }
+
+  const playlistId = detail.playlistUri.split(":").pop() ?? ""
+  if (!/^[A-Za-z0-9]+$/.test(playlistId)) return
+
+  const total = detail.totalCount
+
+  const safeTracks = detail.tracks
+    .filter(
+      (t) =>
+        t &&
+        typeof t.uid === "string" &&
+        typeof t.name === "string" &&
+        t.name.length > 0 &&
+        t.name.length <= 500 &&
+        (total == null ||
+          typeof t.trackNumber !== "number" ||
+          t.trackNumber <= total)
+    )
+    .map((t, i) => ({
+      uid: t.uid,
+      name: t.name,
+      uri: typeof t.uri === "string" ? t.uri : "",
+      id: typeof t.id === "string" ? t.id : "",
+      trackNumber:
+        typeof t.trackNumber === "number" ? t.trackNumber : undefined,
+      position: detail.offset + i
+    }))
+
+  /** Merge an incoming batch into an existing track array, keyed on uid. */
+  function mergeByUid(
+    existing: typeof safeTracks,
+    incoming: typeof safeTracks
+  ): typeof safeTracks {
+    const seen = new Map<string, (typeof safeTracks)[number]>()
+    for (const t of existing) seen.set(t.uid, t)
+    // Incoming pages overwrite stale position data for the same uid
+    for (const t of incoming) seen.set(t.uid, t)
+    return Array.from(seen.values()).sort((a, b) => a.position - b.position)
+  }
+
+  console.log(
+    `[SPO:content] storing ${safeTracks.length} safe tracks, offset=${detail.offset}`
+  )
+  if (detail.offset === 0) {
+    // Fresh playlist load — replace stored tracks
+    chrome.storage.local.set({
+      interceptedPlaylist: {
+        id: playlistId,
+        uri: detail.playlistUri,
+        tracks: safeTracks,
+        complete: detail.complete,
+        totalCount: total
+      }
+    })
+  } else {
+    // Subsequent page — merge into existing store (no duplicates)
+    chrome.storage.local.get(["interceptedPlaylist"], (result) => {
+      const existing = result.interceptedPlaylist as
+        | {
+            id: string
+            uri: string
+            tracks: typeof safeTracks
+            complete: boolean
+            totalCount?: number
+          }
+        | undefined
+
+      if (!existing || existing.id !== playlistId) return
+
+      chrome.storage.local.set({
+        interceptedPlaylist: {
+          ...existing,
+          tracks: mergeByUid(existing.tracks, safeTracks),
+          complete: detail.complete,
+          totalCount: total ?? existing.totalCount
+        }
+      })
+    })
+  }
 })

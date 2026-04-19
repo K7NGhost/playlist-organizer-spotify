@@ -1,5 +1,3 @@
-const CLIENT_ID = "9a009d1f37a6430fac6446d53dc0999a"
-
 type TrackContext = {
   playlistId: string
   playlistLength: number
@@ -8,24 +6,20 @@ type TrackContext = {
   rowIndex: number
 }
 
-type StoredAuthState = {
-  spotify_access_token?: string
-  spotify_refresh_token?: string
-  spotify_expires_at?: number
+type TrackItem = {
+  position: number
+  name: string
+  id: string
+  uri: string
 }
 
-type SpotifyUserProfile = {
-  id?: string
-  product?: string
+type SpotifyTracksPage = {
+  items: Array<{ track?: { id: string; name: string; uri: string } }>
+  next: string | null
 }
 
-type SpotifyPlaylist = {
-  collaborative?: boolean
-  public?: boolean | null
-  owner?: {
-    id?: string
-  }
-  name?: string
+type SpotifyErrorBody = {
+  error?: { message?: string }
 }
 
 const PLAYLIST_ID_PATTERN = /^[A-Za-z0-9]+$/
@@ -74,7 +68,10 @@ function validateReorderMessage(message: unknown) {
     throw new Error("Unsupported message type.")
   }
 
-  if (typeof payload.moveTo !== "string" || !ALLOWED_MOVE_TO.has(payload.moveTo as never)) {
+  if (
+    typeof payload.moveTo !== "string" ||
+    !ALLOWED_MOVE_TO.has(payload.moveTo as never)
+  ) {
     throw new Error("Invalid reorder destination.")
   }
 
@@ -97,154 +94,186 @@ function validateReorderMessage(message: unknown) {
   }
 }
 
-async function getStoredAuth() {
-  return chrome.storage.local.get([
-    "spotify_access_token",
-    "spotify_refresh_token",
-    "spotify_expires_at"
-  ]) as Promise<StoredAuthState>
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    const headers = details.requestHeaders ?? []
+    let accessToken: string | null = null
+    let clientToken: string | null = null
+
+    for (const header of headers) {
+      const name = header.name.toLowerCase()
+      if (name === "authorization" && header.value?.startsWith("Bearer ")) {
+        accessToken = header.value.replace("Bearer ", "")
+      }
+      if (name === "client-token" && header.value) {
+        clientToken = header.value
+      }
+    }
+
+    if (accessToken) {
+      chrome.storage.local.set({ capturedAccessToken: accessToken })
+    }
+    if (clientToken) {
+      chrome.storage.local.set({ capturedClientToken: clientToken })
+    }
+  },
+  { urls: ["https://api-partner.spotify.com/*", "https://api.spotify.com/*"] },
+  ["requestHeaders", "extraHeaders"]
+)
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function refreshAccessToken(refreshToken: string) {
-  const response = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: new URLSearchParams({
-      client_id: CLIENT_ID,
-      grant_type: "refresh_token",
-      refresh_token: refreshToken
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  maxRetries = 3
+): Promise<Response> {
+  let attempt = 0
+  while (true) {
+    const res = await fetch(url, init)
+    if (res.status !== 429 || attempt >= maxRetries) {
+      return res
+    }
+    const retryAfter = Number(res.headers.get("Retry-After") ?? "1")
+    const waitMs = (Number.isFinite(retryAfter) ? retryAfter : 1) * 1000
+    await delay(waitMs)
+    attempt++
+  }
+}
+
+async function getAllTracks(
+  token: string,
+  playlistId: string
+): Promise<TrackItem[]> {
+  const items: TrackItem[] = []
+  let url: string | null =
+    `https://api.spotify.com/v1/playlists/${playlistId}/tracks` +
+    `?fields=items(track(id,name,uri)),next&limit=100&offset=0`
+
+  while (url) {
+    const res = await fetchWithRetry(url, {
+      headers: { Authorization: `Bearer ${token}` }
     })
-  })
-
-  if (!response.ok) {
-    throw new Error(`Spotify refresh failed: ${await response.text()}`)
+    if (!res.ok) {
+      const err: SpotifyErrorBody = await res.json().catch(() => ({}))
+      throw new Error(err.error?.message ?? `HTTP ${res.status}`)
+    }
+    const data: SpotifyTracksPage = await res.json()
+    for (const item of data.items) {
+      if (!item?.track) continue
+      items.push({
+        position: items.length,
+        name: item.track.name || "Unknown",
+        id: item.track.id,
+        uri: item.track.uri
+      })
+    }
+    url = data.next
   }
 
-  return response.json()
-}
-
-async function getValidAccessToken() {
-  const stored = await getStoredAuth()
-
-  if (
-    stored.spotify_access_token &&
-    stored.spotify_expires_at &&
-    Date.now() < stored.spotify_expires_at - 60_000
-  ) {
-    return stored.spotify_access_token
-  }
-
-  if (!stored.spotify_refresh_token) {
-    throw new Error("No Spotify refresh token found. Reconnect the extension from the popup.")
-  }
-
-  const refreshed = await refreshAccessToken(stored.spotify_refresh_token)
-  const expiresAt = Date.now() + refreshed.expires_in * 1000
-
-  await chrome.storage.local.set({
-    spotify_access_token: refreshed.access_token,
-    spotify_expires_at: expiresAt,
-    ...(refreshed.refresh_token
-      ? { spotify_refresh_token: refreshed.refresh_token }
-      : {})
-  })
-
-  return refreshed.access_token as string
+  return items
 }
 
 async function reorderTrack(
   accessToken: string,
   playlistId: string,
-  fromIndex: number,
+  rangeStart: number,
   insertBefore: number
-) {
-  const response = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/items`, {
-    method: "PUT",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      range_start: fromIndex,
-      insert_before: insertBefore,
-      range_length: 1
-    })
-  })
+): Promise<{ snapshot_id: string }> {
+  const response = await fetchWithRetry(
+    `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        range_start: rangeStart,
+        insert_before: insertBefore,
+        range_length: 1
+      })
+    }
+  )
 
   if (!response.ok) {
-    throw new Error(`Spotify reorder failed: ${await response.text()}`)
+    throw new Error(
+      `Spotify reorder failed (${response.status}): ${await response.text()}`
+    )
   }
 
   return response.json()
 }
 
-async function getCurrentUserProfile(accessToken: string) {
-  const response = await fetch("https://api.spotify.com/v1/me", {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
+async function moveItemsInPlaylist(
+  accessToken: string,
+  clientToken: string,
+  playlistUri: string,
+  uids: string[],
+  fromUid: string,
+  moveType: "BEFORE_UID" | "AFTER_UID" = "BEFORE_UID"
+): Promise<unknown> {
+  const response = await fetchWithRetry(
+    "https://api-partner.spotify.com/pathfinder/v2/query",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Client-Token": clientToken,
+        "Content-Type": "application/json;charset=UTF-8",
+        Accept: "application/json",
+        "App-Platform": "WebPlayer"
+      },
+      body: JSON.stringify({
+        variables: {
+          playlistUri,
+          uids,
+          newPosition: { moveType, fromUid }
+        },
+        operationName: "moveItemsInPlaylist",
+        extensions: {
+          persistedQuery: {
+            version: 1,
+            sha256Hash:
+              "47b2a1234b17748d332dd0431534f22450e9ecbb3d5ddcdacbd83368636a0990"
+          }
+        }
+      })
     }
-  })
+  )
 
   if (!response.ok) {
-    throw new Error(`Spotify profile lookup failed: ${await response.text()}`)
+    throw new Error(
+      `Spotify move failed (${response.status}): ${await response.text()}`
+    )
   }
 
-  return (await response.json()) as SpotifyUserProfile
-}
-
-async function getPlaylistDetails(accessToken: string, playlistId: string) {
-  const response = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    }
-  })
-
-  if (!response.ok) {
-    throw new Error(`Spotify playlist lookup failed: ${await response.text()}`)
+  const body = (await response.json()) as {
+    errors?: { message?: string }[]
+    data?: unknown
   }
-
-  return (await response.json()) as SpotifyPlaylist
-}
-
-async function buildForbiddenDiagnostic(accessToken: string, context: TrackContext) {
-  try {
-    const [profile, playlist] = await Promise.all([
-      getCurrentUserProfile(accessToken),
-      getPlaylistDetails(accessToken, context.playlistId)
-    ])
-
-    const ownerId = playlist.owner?.id ?? "unknown"
-    const userId = profile.id ?? "unknown"
-    const ownsPlaylist = ownerId !== "unknown" && ownerId === userId
-    const collaborative = Boolean(playlist.collaborative)
-    const playlistType =
-      playlist.public === true ? "public" : playlist.public === false ? "private" : "unknown"
-
-    return [
-      "Spotify returned 403 Forbidden.",
-      `Current user: ${userId}`,
-      `Playlist owner: ${ownerId}`,
-      `Owns playlist: ${ownsPlaylist ? "yes" : "no"}`,
-      `Collaborative playlist: ${collaborative ? "yes" : "no"}`,
-      `Playlist visibility: ${playlistType}`,
-      `Account product: ${profile.product ?? "unknown"}`,
-      "If you do own this playlist, the most likely causes are missing modify consent on the token or Spotify app access restrictions in developer mode."
-    ].join(" ")
-  } catch (error) {
-    return error instanceof Error
-      ? `Spotify returned 403 Forbidden. Diagnostic lookup also failed: ${error.message}`
-      : "Spotify returned 403 Forbidden. Diagnostic lookup also failed."
+  if (body?.errors?.length) {
+    throw new Error(body.errors[0]?.message ?? "Spotify GraphQL error")
   }
+  return body
 }
-
-async function handleReorderRequest(
+async function handleContextMenuReorder(
   context: TrackContext,
   moveTo: "top" | "middle" | "bottom" | "index",
   targetIndex?: number
 ) {
-  const accessToken = await getValidAccessToken()
+  const stored = (await chrome.storage.local.get(["capturedAccessToken"])) as {
+    capturedAccessToken?: string
+  }
+
+  if (!stored.capturedAccessToken) {
+    throw new Error(
+      "No Spotify access token captured. Browse open.spotify.com to capture tokens automatically."
+    )
+  }
+
   const insertBefore =
     moveTo === "top"
       ? 0
@@ -254,18 +283,12 @@ async function handleReorderRequest(
           ? Math.max(0, Math.min(targetIndex ?? 0, context.playlistLength))
           : Math.max(context.playlistLength, 1)
 
-  try {
-    await reorderTrack(accessToken, context.playlistId, context.rowIndex, insertBefore)
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message.includes('"status": 403')
-    ) {
-      throw new Error(await buildForbiddenDiagnostic(accessToken, context))
-    }
-
-    throw error
-  }
+  await reorderTrack(
+    stored.capturedAccessToken,
+    context.playlistId,
+    context.rowIndex,
+    insertBefore
+  )
 
   return {
     ok: true,
@@ -277,44 +300,116 @@ async function handleReorderRequest(
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type !== "spotify-reorder-track") {
-    return
-  }
-
-  if (sender.id !== chrome.runtime.id) {
-    sendResponse({
-      ok: false,
-      error: "Rejected message from unexpected sender."
-    })
-    return false
-  }
-
-  let validatedMessage: ReturnType<typeof validateReorderMessage>
-
-  try {
-    validatedMessage = validateReorderMessage(message)
-  } catch (error) {
-    sendResponse({
-      ok: false,
-      error: error instanceof Error ? error.message : "Invalid reorder request."
-    })
-    return false
-  }
-
-  void handleReorderRequest(
-    validatedMessage.context,
-    validatedMessage.moveTo,
-    validatedMessage.targetIndex
-  )
-    .then((result) => {
-      sendResponse(result)
-    })
-    .catch((error) => {
+  // Context-menu reorder dispatched by the content script
+  if (message?.type === "spotify-reorder-track") {
+    if (sender.id !== chrome.runtime.id) {
       sendResponse({
         ok: false,
-        error: error instanceof Error ? error.message : "Spotify reorder failed."
+        error: "Rejected message from unexpected sender."
       })
-    })
+      return false
+    }
 
-  return true
+    let validated: ReturnType<typeof validateReorderMessage>
+    try {
+      validated = validateReorderMessage(message)
+    } catch (error) {
+      sendResponse({
+        ok: false,
+        error:
+          error instanceof Error ? error.message : "Invalid reorder request."
+      })
+      return false
+    }
+
+    void handleContextMenuReorder(
+      validated.context,
+      validated.moveTo,
+      validated.targetIndex
+    )
+      .then((result) => sendResponse(result))
+      .catch((error) =>
+        sendResponse({
+          ok: false,
+          error:
+            error instanceof Error ? error.message : "Spotify reorder failed."
+        })
+      )
+
+    return true
+  }
+
+  if (message?.type === "FETCH_PLAYLIST") {
+    const { accessToken, playlistId } = message as {
+      accessToken: string
+      playlistId: string
+    }
+
+    void getAllTracks(accessToken, playlistId)
+      .then((items) => sendResponse({ items }))
+      .catch((err: unknown) =>
+        sendResponse({
+          error:
+            err instanceof Error
+              ? err.message
+              : "Failed to fetch playlist tracks."
+        })
+      )
+
+    return true
+  }
+
+  if (message?.type === "REORDER_TRACK") {
+    const { accessToken, playlistId, rangeStart, insertBefore } = message as {
+      accessToken: string
+      playlistId: string
+      rangeStart: number
+      insertBefore: number
+    }
+
+    void reorderTrack(accessToken, playlistId, rangeStart, insertBefore)
+      .then((data) => sendResponse({ status: 200, data }))
+      .catch((err: unknown) =>
+        sendResponse({
+          error: err instanceof Error ? err.message : "Track reorder failed."
+        })
+      )
+
+    return true
+  }
+
+  if (message?.type === "MOVE_ITEMS") {
+    const {
+      accessToken,
+      clientToken,
+      playlistUri,
+      uids,
+      fromUid,
+      moveType = "BEFORE_UID"
+    } = message as {
+      accessToken: string
+      clientToken: string
+      playlistUri: string
+      uids: string[]
+      fromUid: string
+      moveType?: "BEFORE_UID" | "AFTER_UID"
+    }
+
+    void moveItemsInPlaylist(
+      accessToken,
+      clientToken,
+      playlistUri,
+      uids,
+      fromUid,
+      moveType
+    )
+      .then((data) => sendResponse({ status: 200, data }))
+      .catch((err: unknown) =>
+        sendResponse({
+          error: err instanceof Error ? err.message : "Track move failed."
+        })
+      )
+
+    return true
+  }
 })

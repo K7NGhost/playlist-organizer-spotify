@@ -1,7 +1,7 @@
 {
   "name": "spotify-playlist-organizer",
   "displayName": "Playlist organizer for Spotify",
-  "version": "0.0.1",
+  "version": "1.0.1",
   "description": "Organize your spotify playlist.",
   "author": "k7nghost",
   "scripts": {
@@ -40,12 +40,14 @@
       }
     },
     "permissions": [
-      "identity",
-      "storage"
+      "storage",
+      "webRequest",
+      "tabs"
     ],
     "host_permissions": [
-      "https://accounts.spotify.com/*",
-      "https://api.spotify.com/*"
+      "https://api.spotify.com/*",
+      "https://api-partner.spotify.com/*",
+      "https://open.spotify.com/*"
     ]
   }
 }
