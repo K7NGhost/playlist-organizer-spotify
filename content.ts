@@ -22,6 +22,123 @@ let activeTrackContext: TrackContext | null = null
 let reorderExpanded = false
 let lastMenuSignature = ""
 let closeSubmenuTimeout: number | null = null
+let extensionContextInvalidated = false
+
+function hasLiveExtensionContext() {
+  if (extensionContextInvalidated) {
+    return false
+  }
+
+  try {
+    return Boolean(chrome?.runtime?.id)
+  } catch {
+    extensionContextInvalidated = true
+    return false
+  }
+}
+
+function getErrorMessage(error: unknown) {
+  if (error instanceof Error) {
+    return error.message
+  }
+
+  if (typeof error === "string") {
+    return error
+  }
+
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof (error as { message?: unknown }).message === "string"
+  ) {
+    return (error as { message: string }).message
+  }
+
+  return ""
+}
+
+function isExtensionContextInvalidatedError(error: unknown) {
+  return /Extension context invalidated/i.test(getErrorMessage(error))
+}
+
+function markExtensionContextInvalidated(error: unknown) {
+  if (isExtensionContextInvalidatedError(error)) {
+    extensionContextInvalidated = true
+    return true
+  }
+
+  return false
+}
+
+async function safeStorageGet<T>(keys: string[]): Promise<T | null> {
+  if (!hasLiveExtensionContext()) {
+    return null
+  }
+
+  try {
+    return (await chrome.storage.local.get(keys)) as T
+  } catch (error) {
+    if (markExtensionContextInvalidated(error)) {
+      return null
+    }
+
+    throw error
+  }
+}
+
+async function safeStorageSet(values: Record<string, unknown>) {
+  if (!hasLiveExtensionContext()) {
+    return false
+  }
+
+  try {
+    await chrome.storage.local.set(values)
+    return true
+  } catch (error) {
+    if (markExtensionContextInvalidated(error)) {
+      return false
+    }
+
+    throw error
+  }
+}
+
+async function safeRuntimeSendMessage<T>(message: unknown): Promise<T | null> {
+  if (!hasLiveExtensionContext()) {
+    return null
+  }
+
+  try {
+    return (await chrome.runtime.sendMessage(message)) as T
+  } catch (error) {
+    if (markExtensionContextInvalidated(error)) {
+      return null
+    }
+
+    throw error
+  }
+}
+
+function safeSendResponse(
+  sendResponse: (response?: unknown) => void,
+  response?: unknown
+) {
+  if (!hasLiveExtensionContext()) {
+    return false
+  }
+
+  try {
+    sendResponse(response)
+    return true
+  } catch (error) {
+    if (markExtensionContextInvalidated(error)) {
+      return false
+    }
+
+    throw error
+  }
+}
 
 function extractTrackContext(trackRow: Element): TrackContext | null {
   const rowContainer = trackRow.parentElement
@@ -302,11 +419,20 @@ async function sendReorderRequest(
 
   try {
     // --- Try partner API (UID-based) first using intercepted playlist data ---
-    const stored = await chrome.storage.local.get([
+    const stored = await safeStorageGet<{
+      interceptedPlaylist?: StoredPlaylist
+      capturedAccessToken?: string
+      capturedClientToken?: string
+    }>([
       "interceptedPlaylist",
       "capturedAccessToken",
       "capturedClientToken"
     ])
+
+    if (!stored) {
+      showToast("Extension reloaded. Refresh the Spotify tab and try again.", true)
+      return
+    }
 
     const intercepted = stored.interceptedPlaylist as StoredPlaylist | undefined
     const accessToken = stored.capturedAccessToken as string | undefined
@@ -357,7 +483,9 @@ async function sendReorderRequest(
         }
 
         if (fromUid) {
-          const moveResponse = (await chrome.runtime.sendMessage({
+          const moveResponse = await safeRuntimeSendMessage<{
+            error?: string
+          }>({
             type: "MOVE_ITEMS",
             accessToken,
             clientToken,
@@ -365,7 +493,15 @@ async function sendReorderRequest(
             uids: [selectedTrack.uid],
             fromUid,
             moveType
-          })) as { error?: string } | undefined
+          })
+
+          if (!moveResponse) {
+            showToast(
+              "Extension reloaded. Refresh the Spotify tab and try again.",
+              true
+            )
+            return
+          }
 
           if (!moveResponse?.error) {
             showToast(
@@ -379,12 +515,21 @@ async function sendReorderRequest(
     }
 
     // --- Fall back to REST API ---
-    const response = await chrome.runtime.sendMessage({
+    const response = await safeRuntimeSendMessage<{
+      ok?: boolean
+      error?: string
+      message?: string
+    }>({
       type: "spotify-reorder-track",
       moveTo,
       targetIndex,
       context: activeTrackContext
     })
+
+    if (!response) {
+      showToast("Extension reloaded. Refresh the Spotify tab and try again.", true)
+      return
+    }
 
     if (!response?.ok) {
       throw new Error(response?.error ?? "Spotify reorder failed.")
@@ -798,12 +943,12 @@ window.fetch = async function (...args: Parameters<typeof fetch>) {
       : (headers as Record<string, string>)?.["client-token"]
 
     if (typeof auth === "string" && auth.startsWith("Bearer ")) {
-      chrome.storage.local.set({
+      void safeStorageSet({
         capturedAccessToken: auth.replace("Bearer ", "")
       })
     }
     if (typeof clientTok === "string" && clientTok) {
-      chrome.storage.local.set({ capturedClientToken: clientTok })
+      void safeStorageSet({ capturedClientToken: clientTok })
     }
   }
 
@@ -817,12 +962,12 @@ XMLHttpRequest.prototype.setRequestHeader = function (
   value: string
 ) {
   if (header === "Authorization" && value.startsWith("Bearer ")) {
-    chrome.storage.local.set({
+    void safeStorageSet({
       capturedAccessToken: value.replace("Bearer ", "")
     })
   }
   if (header === "client-token" && value) {
-    chrome.storage.local.set({ capturedClientToken: value })
+    void safeStorageSet({ capturedClientToken: value })
   }
   return _originalSetRequestHeader.call(this, header, value)
 }
@@ -833,20 +978,22 @@ XMLHttpRequest.prototype.setRequestHeader = function (
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "PING") {
-    sendResponse({ message: "Pong from content script" })
+    safeSendResponse(sendResponse, { message: "Pong from content script" })
     return false
   }
 
   if (message?.type === "GET_TOKENS") {
-    chrome.storage.local.get(
-      ["capturedAccessToken", "capturedClientToken"],
-      (result) => {
-        sendResponse({
-          accessToken: result.capturedAccessToken ?? null,
-          clientToken: result.capturedClientToken ?? null
-        })
-      }
-    )
+    void (async () => {
+      const result = await safeStorageGet<{
+        capturedAccessToken?: string
+        capturedClientToken?: string
+      }>(["capturedAccessToken", "capturedClientToken"])
+
+      safeSendResponse(sendResponse, {
+        accessToken: result?.capturedAccessToken ?? null,
+        clientToken: result?.capturedClientToken ?? null
+      })
+    })()
     return true // keep channel open for async response
   }
 })
@@ -930,7 +1077,7 @@ window.addEventListener("__spo_tracks__", (event) => {
   )
   if (detail.offset === 0) {
     // Fresh playlist load — replace stored tracks
-    chrome.storage.local.set({
+    void safeStorageSet({
       interceptedPlaylist: {
         id: playlistId,
         uri: detail.playlistUri,
@@ -941,7 +1088,18 @@ window.addEventListener("__spo_tracks__", (event) => {
     })
   } else {
     // Subsequent page — merge into existing store (no duplicates)
-    chrome.storage.local.get(["interceptedPlaylist"], (result) => {
+    void (async () => {
+      const result = await safeStorageGet<{
+        interceptedPlaylist?: {
+          id: string
+          uri: string
+          tracks: typeof safeTracks
+          complete: boolean
+          totalCount?: number
+        }
+      }>(["interceptedPlaylist"])
+
+      if (!result) return
       const existing = result.interceptedPlaylist as
         | {
             id: string
@@ -954,7 +1112,7 @@ window.addEventListener("__spo_tracks__", (event) => {
 
       if (!existing || existing.id !== playlistId) return
 
-      chrome.storage.local.set({
+      await safeStorageSet({
         interceptedPlaylist: {
           ...existing,
           tracks: mergeByUid(existing.tracks, safeTracks),
@@ -962,6 +1120,6 @@ window.addEventListener("__spo_tracks__", (event) => {
           totalCount: total ?? existing.totalCount
         }
       })
-    })
+    })()
   }
 })
