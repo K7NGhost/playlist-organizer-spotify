@@ -1,33 +1,9 @@
-This is a [Plasmo extension](https://docs.plasmo.com/) project bootstrapped with [`plasmo init`](https://www.npmjs.com/package/plasmo).
+# Playlist organizer for Spotify
 
-## Getting Started
+Quickly organize your playlist with additional options like moving your song to the top, middle, bottom, or a location you specify. 
 
-First, run the development server:
+<img width="1048" height="647" alt="image" src="https://github.com/user-attachments/assets/059dc072-4909-47cb-8acf-c5ec2b7f993f" />
 
-```bash
-pnpm dev
-# or
-npm run dev
-```
+<img width="396" height="602" alt="image" src="https://github.com/user-attachments/assets/2347adc7-3f01-45c9-8240-068abad6072f" />
 
-Open your browser and load the appropriate development build. For example, if you are developing for the chrome browser, using manifest v3, use: `build/chrome-mv3-dev`.
 
-You can start editing the popup by modifying `popup.tsx`. It should auto-update as you make changes. To add an options page, simply add a `options.tsx` file to the root of the project, with a react component default exported. Likewise to add a content page, add a `content.ts` file to the root of the project, importing some module and do some logic, then reload the extension on your browser.
-
-For further guidance, [visit our Documentation](https://docs.plasmo.com/)
-
-## Making production build
-
-Run the following:
-
-```bash
-pnpm build
-# or
-npm run build
-```
-
-This should create a production bundle for your extension, ready to be zipped and published to the stores.
-
-## Submit to the webstores
-
-The easiest way to deploy your Plasmo extension is to use the built-in [bpp](https://bpp.browser.market) GitHub action. Prior to using this action however, make sure to build your extension and upload the first version to the store to establish the basic credentials. Then, simply follow [this setup instruction](https://docs.plasmo.com/framework/workflows/submit) and you should be on your way for automated submission!
